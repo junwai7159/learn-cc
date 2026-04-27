@@ -1,25 +1,43 @@
 #!/usr/bin/env python3
-# Harness: tool dispatch -- expanding what the model can reach.
+# Harness: on-demand knowledge -- domain expertise, loaded when the model asks.
 """
-s02-tool_use.py - Tool dispatch
+s05-skill_loading.py - Skills
 
-The agent loop from s01 didn't change. We just added tools to the array
-and a dispatch map to route calls.
+Two-layer skill injection that avoids bloating the system prompt:
 
-    +----------+      +-------+      +------------------+
-    |   User   | ---> |  LLM  | ---> | Tool Dispatch    |
-    |  prompt  |      |       |      | {                |
-    +----------+      +---+---+      |   bash: run_bash |
-                          ^          |   read: run_read |
-                          |          |   write: run_wr  |
-                          +----------+   edit: run_edit |
-                          tool_result| }                |
-                                     +------------------+
+    Layer 1 (cheap): skill names in system prompt (~100 tokens/skill)
+    Layer 2 (on demand): full skill body in tool_result
 
-Key insight: "The loop didn't change at all. I just added tools."
+    skills/
+      pdf/
+        SKILL.md          <-- frontmatter (name, description) + body
+      code-review/
+        SKILL.md
+
+    System prompt:
+    +--------------------------------------+
+    | You are a coding agent.              |
+    | Skills available:                    |
+    |   - pdf: Process PDF files...        |  <-- Layer 1: metadata only
+    |   - code-review: Review code...      |
+    +--------------------------------------+
+
+    When model calls load_skill("pdf"):
+    +--------------------------------------+
+    | tool_result:                         |
+    | <skill>                              |
+    |   Full PDF processing instructions   |  <-- Layer 2: full body
+    |   Step 1: ...                        |
+    |   Step 2: ...                        |
+    | </skill>                             |
+    +--------------------------------------+
+
+Key insight: "Don't put everything in the system prompt. Load on demand."
 """
 
 import os
+import re
+import yaml
 import subprocess
 from pathlib import Path
 
@@ -32,7 +50,72 @@ client = AnthropicBedrock()
 
 MODEL = os.environ["MODEL_ID"]
 WORKDIR = Path.cwd()
-SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. Act, don't explain."
+SKILLS_DIR = WORKDIR / "skills"
+
+
+# -- SkillLoader: scan skills/<name>/SKILL.md with YAML frontmatter
+class SkillLoader:
+    def __init__(self, skills_dir: Path) -> None:
+        self.skills_dir = skills_dir
+        self.skills = {}
+        self._load_all()
+
+
+    def _load_all(self):
+        if not self.skills_dir.exists():
+            return
+        for f in sorted(self.skills_dir.rglob("SKILL.md")):
+            text = f.read_text()
+            meta, body = self._parse_frontmatter(text)
+            name = meta.get("name", f.parent.name)
+            self.skills[name] = {"meta": meta, "body": body, "path": str(f)}
+
+
+    def _parse_frontmatter(self, text: str) -> tuple:
+        """Parse YAML frontmatter between --- delimiters."""
+        match = re.match(r"^---\n(.*?)\n---\n(.*)", text, re.DOTALL)
+        if not match:
+            return {}, text
+        try:
+            meta = yaml.safe_load(match.group(1)) or {}
+        except yaml.YAMLError:
+            meta = {}
+        return meta, match.group(2).strip()
+    
+    
+    def get_descriptions(self) -> str:
+        """Layer 1: short descriptions for the system prompt."""
+        if not self.skills:
+            return "(no skills available)"
+        
+        lines = []
+        for name, skill in self.skills.items():
+            desc = skill["meta"].get("description", "No description")
+            tags = skill["meta"].get("tags", "")
+            line = f"  - {name}: {desc}"
+            if tags:
+                line += f" [{tags}]"
+            lines.append(line)
+        return "\n".join(lines)
+
+
+    def get_content(self, name: str) -> str:
+        """Layer 2: full skill body returned in tool_result."""
+        skill = self.skills.get(name)
+        if not skill:
+            return f"Error: Unknown skill '{name}'. Available: {', '.join(self.skills.keys())}"
+        return f"<skill name=\"{name}\">\n{skill['body']}\n</skill>"
+
+
+SKILL_LOADER = SkillLoader(SKILLS_DIR)
+
+# Layer 1: skill metadata injected into system prompt
+SYSTEM = f"""You are a coding agent at {WORKDIR}.
+Use load_skill to access specialized knowledge before tackling unfamiliar topics.
+
+Skills available:
+{SKILL_LOADER.get_descriptions}
+"""
 
 
 # -- Tool implementations --
@@ -97,6 +180,7 @@ TOOL_HANDLERS = {
     "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+    "load_skills": lambda **kw: SKILL_LOADER.get_content(kw["name"]),
 }
 
 TOOLS = [
@@ -136,6 +220,15 @@ TOOLS = [
             "required": ["path", "old_text", "new_text"]
         }
     },
+    {
+        "name": "load_skills",
+        "description": "Load specialized knowledge by name.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"name": {"type": "string", "description": "Skill name to load"}},
+            "required": ["name"]
+        }
+    },
 ]
 
 
@@ -159,21 +252,23 @@ def agent_loop(messages: list) -> None:
         for block in response.content:
             if block.type == "tool_use":
                 handler = TOOL_HANDLERS.get(block.name)
-                output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
-                print(f"> {block.name}")
-                print(output[:200])
-                results.append({
-                    "type": "tool_result", "tool_use_id": block.id, "content": output
-                })
+                try:
+                    output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
+                except Exception as e:
+                    output = f"Error: {e}"
+                print(f"> {block.name}:")
+                print(str(output)[:200])
+                results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
+        
         messages.append({"role": "user", "content": results})
-
+            
 
 if __name__ == "__main__":
     history = []
     
     while True:
         try:
-            query = input("\033[36ms02 >> \033[0m")
+            query = input("\033[36ms05 >> \033[0m")
         except(EOFError, KeyboardInterrupt):
             break
         

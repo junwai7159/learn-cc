@@ -1,33 +1,33 @@
 #!/usr/bin/env python3
-# Harness: planning -- keeping the model on course without scripting the route.
+# Harness: background execution -- the model thinks while the harness waits.
 """
-s03-todo_write.py - TodoWrite
+s08_background_tasks.py - Background Tasks
 
-The model tracks its own progress via a TodoManager. A nag reminder
-forces it to keep updating when it forgets.
+Run commands in background threads. A notification queue is drained
+before each LLM call to deliver results.
 
-    +----------+      +-------+      +---------+
-    |   User   | ---> |  LLM  | ---> | Tools   |
-    |  prompt  |      |       |      | + todo  |
-    +----------+      +---+---+      +----+----+
-                          ^               |
-                          |   tool_result |
-                          +---------------+
-                                |
-                    +-----------+-----------+
-                    | TodoManager state     |
-                    | [ ] task A            |
-                    | [>] task B <- doing   |
-                    | [x] task C            |
-                    +-----------------------+
-                                |
-                    if rounds_since_todo >= 3:
-                      inject <reminder>
+    Main thread                Background thread
+    +-----------------+        +-----------------+
+    | agent loop      |        | task executes   |
+    | ...             |        | ...             |
+    | [LLM call] <---+------- | enqueue(result) |
+    |  ^drain queue   |        +-----------------+
+    +-----------------+
 
-Key insight: "The agent can track its own progress -- and I can see it."
+    Timeline:
+    Agent ----[spawn A]----[spawn B]----[other work]----
+                 |              |
+                 v              v
+              [A runs]      [B runs]        (parallel)
+                 |              |
+                 +-- notification queue --> [results injected]
+
+Key insight: "Fire and forget -- the agent doesn't block while the command runs."
 """
 
 import os
+import uuid
+import threading
 import subprocess
 from pathlib import Path
 
@@ -40,54 +40,76 @@ client = AnthropicBedrock()
 
 MODEL = os.environ["MODEL_ID"]
 WORKDIR = Path.cwd()
-SYSTEM = f"""You are a coding agent at {WORKDIR}.
-Use the todo tool to plan multi-step tasks. Mark in_progress before starting, completed when done.
-Prefer tools over prose."""
+SYSTEM = f"You are a coding agent at {WORKDIR}. Use background_run for long-running commands."
 
 
-# -- TodoManager: structured state the LLM writes to --
-class TodoManager:
-    def __init__(self) -> None:
-        self.items = []
+# -- BackgroundManager: threaded execution + notification queue --
+class BackgroundManager():
+    def __init__(self):
+        self.tasks = {} # task_id -> {status, result, command}
+        self._notification_queue = [] # completed task results
+        self._lock = threading.Lock()
     
-    def update(self, items: list) -> str:
-        if len(items) > 20:
-            raise ValueError("Max 20 todos allowed")
-        validated, in_progress_count = [], 0
+    def run(self, command: str) -> str:
+        """Start a background thread, return task_id immediately."""
+        task_id = str(uuid.uuid4())[:8]
+        self.tasks[task_id] = {"status": "running", "result": None, "command": command}
+        thread = threading.Thread(
+            target=self._execute, args=(task_id, command), daemon=True
+        )
+        thread.start()
+        return f"Background task {task_id} started: {command[:80]}"
+    
+    
+    def _execute(self, task_id: str, command: str):
+        """Thread target: run subprocess, capture output, push to queue."""
+        try:
+            r = subprocess.run(
+                command, shell=True, cwd=WORKDIR,
+                capture_output=True, text=True, timeout=300
+            )
+            output = (r.stdout + r.stderr).strip()[:50000]
+            status = "completed"
+        except subprocess.TimeoutExpired:
+            output = "Error: Timeout (300s)"
+            status = "timeout"
+        except Exception as e:
+            output = f"Error: {e}"
+            status = "error"
+        self.tasks[task_id]["status"] = status
+        self.tasks[task_id]["result"] = output or "(no output)"
+        with self._lock:
+            self._notification_queue.append({
+                "task_id": task_id,
+                "status": status,
+                "command": command[:80],
+                "result": (output or "(no output)")[:500],
+            })
         
-        for i, item in enumerate(items):
-            text = str(item.get("text", "")).strip()
-            status = str(item.get("status", "pending")).lower()
-            item_id = str(item.get("id", str(i + 1)))
-            if not text:
-                raise ValueError(f"Item {item_id}: text required")
-            if status not in ("pending", "in_progress", "completed"):
-                raise ValueError(f"Item {item_id}: invalid status '{status}'")
-            if status == "in_progress":
-                in_progress_count += 1
-            validated.append({"id": item_id, "text": text, "status": status})
-        
-        if in_progress_count > 1:
-            raise ValueError("Only one task can be in_progress")
-        
-        self.items = validated
-        
-        return self.render()
 
-
-    def render(self) -> str:
-        if not self.items:
-            return "No todos."
+    def check(self, task_id: str = None) -> str:
+        """Check status of one task or list all."""
+        if task_id:
+            t = self.tasks.get(task_id)
+            if not t:
+                return f"Error: Unknown task {task_id}"
+            return f"[{t['status']}] {t['command'][:60]}\n{t.get('result') or '(running)'}"
         lines = []
-        for item in self.items:
-            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}[item["status"]]
-            lines.append(f"{marker} #{item['id']}: {item['text']}")
-        done = sum(1 for t in self.items if t["status"] == "completed")
-        lines.append(f"\n({done}/{len(self.items)} completed)")
-        return "\n".join(lines)
+        for tid, t in self.tasks.items():
+            lines.append(f"{tid}: [{t['status']}] {t['command'][:60]}")
+        return "\n".join(lines) if lines else "No background tasks."
 
 
-TODO = TodoManager()
+    def drain_notifications(self) -> list:
+        """Return and clear all pending completion notifications."""
+        with self._lock:
+            notifs = list(self._notification_queue)
+            self._notification_queue.clear()
+        return notifs
+
+
+BG = BackgroundManager()
+
 
 # -- Tool implementations --
 def safe_path(p: str) -> Path:
@@ -151,8 +173,10 @@ TOOL_HANDLERS = {
     "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
-    "todo": lambda **kw: TODO.update(kw["items"]),
+    "background_run":   lambda **kw: BG.run(kw["command"]),
+    "check_background": lambda **kw: BG.check(kw.get("task_id")),
 }
+
 
 TOOLS = [
     {
@@ -192,12 +216,19 @@ TOOLS = [
         }
     },
     {
-        "name": "todo",
-        "description": "Update task list. Track progress on multi-step tasks.",
+        "name": "background_run",
+        "description": "Run command in background thread. Returns task_id immediately.",
+        "input_schema": {
+            "type": "object", "properties": {"command": {"type": "string"}},
+            "required": ["command"]
+        }
+    },
+    {
+        "name": "check_background",
+        "description": "Check background task status. Omit task_id to list all.",
         "input_schema": {
             "type": "object",
-            "properties": {"items": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "text": {"type": "string"}, "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]}}, "required": ["id", "text", "status"]}}},
-            "required": ["items"]
+            "properties": {"task_id": {"type": "string"}}
         }
     },
 ]
@@ -205,9 +236,15 @@ TOOLS = [
 
 # -- The core pattern: a while loop that calls tools until the model stops --
 def agent_loop(messages: list) -> None:
-    rounds_since_todo = 0
-    
     while True:
+        # Drain background notifications and inject as system message before LLM call
+        notifs = BG.drain_notifications()
+        if notifs and messages:
+            notif_text = "\n".join(
+                f"[bg:{n['task_id']}] {n['status']}: {n['result']}" for n in notifs
+            )
+            messages.append({"role": "user", "content": f"<background-results>\n{notif_text}\n</background-results>"})
+        
         response = client.messages.create(
             model=MODEL, system=SYSTEM, messages=messages,
             tools=TOOLS, max_tokens=8000
@@ -222,7 +259,6 @@ def agent_loop(messages: list) -> None:
 
         # Execute each tool call, collect results
         results = []
-        used_todo = False
         for block in response.content:
             if block.type == "tool_use":
                 handler = TOOL_HANDLERS.get(block.name)
@@ -230,25 +266,19 @@ def agent_loop(messages: list) -> None:
                     output = handler(**block.input) if handler else f"Unknown tool: {block.name}"
                 except Exception as e:
                     output = f"Error: {e}"
-                print(f"> {block.name}")
-                print(str(output[:200]))
+                print(f"> {block.name}:")
+                print(str(output)[:200])
                 results.append({"type": "tool_result", "tool_use_id": block.id, "content": output})
-                if block.name == "todo":
-                    used_todo = True
-        rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
         
-        # Nag reminder is injected below, alongside tool results
-        if rounds_since_todo >= 3:
-            results.append({"type": "text", "text": "<reminder>Update your todos.</reminder>"})
         messages.append({"role": "user", "content": results})
-            
+
 
 if __name__ == "__main__":
     history = []
     
     while True:
         try:
-            query = input("\033[36ms03 >> \033[0m")
+            query = input("\033[36ms08 >> \033[0m")
         except(EOFError, KeyboardInterrupt):
             break
         
