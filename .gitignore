@@ -210,3 +210,4 @@ __marimo__/
 .tasks/*
 .team/*
 .transcripts/*
+.worktrees/*
